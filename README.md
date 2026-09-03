@@ -47,6 +47,8 @@ Useful options:
 - `--debounce DURATION` — wait for changes to settle; defaults to `150ms`.
 - `--no-initial-run` — do not run until a relevant change arrives.
 - `--markers` — put machine-readable start and end lines around each run.
+- `--raw-output` — attach child output directly to the terminal, retaining
+  terminal-aware color and formatting. Cannot be used with `--markers`.
 - `--print-events` — print accepted filesystem events to standard error.
 - `--no-gitignore` — include paths normally ignored by the repository.
 
@@ -56,9 +58,11 @@ Durations use whole-number `ms`, `s`, `m`, or `h` units, such as `150ms`,
 ## How it works
 
 Stalker watches the given paths recursively using the operating system's file
-watcher. It filters events against the watch roots, your include and ignore
-globs, and repository `.gitignore` rules. It starts the command once by
-default, then groups rapid changes into one rerun after the debounce period.
+watcher. It filters events inside `--cwd` against the watch roots, your include
+and ignore globs, and repository `.gitignore` rules. Paths watched outside
+`--cwd` are accepted based on their watch roots only; CWD-relative globs and
+`.gitignore` rules do not apply to them. It starts the command once by default,
+then groups rapid changes into one rerun after the debounce period.
 
 Only one child command runs at a time. If files change while it runs, Stalker
 starts one follow-up run as soon as the current command exits. Child output

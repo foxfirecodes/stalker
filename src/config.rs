@@ -70,6 +70,10 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     markers: bool,
 
+    /// Attach child output directly to the terminal, preserving terminal-aware output such as color.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "markers")]
+    raw_output: bool,
+
     /// Write accepted filesystem events to stderr.
     #[arg(long = "print-events", action = ArgAction::SetTrue)]
     print_events: bool,
@@ -94,6 +98,7 @@ pub struct Config {
     pub commands: Vec<CommandSpec>,
     pub watch: WatchSpec,
     pub output: OutputMode,
+    pub raw_output: bool,
     pub initial_run: bool,
     pub print_events: bool,
     pub gitignore: bool,
@@ -170,6 +175,7 @@ impl Config {
             } else {
                 OutputMode::Passthrough
             },
+            raw_output: cli.raw_output,
             initial_run: !cli.no_initial_run,
             print_events: cli.print_events,
             gitignore: !cli.no_gitignore,
@@ -271,7 +277,7 @@ pub fn run() -> Result<()> {
     // startup window cannot be missed.
     let watcher = NativeWatcher::new(config.watch.roots.clone())?;
     let (event_sender, event_receiver) = crossbeam_channel::unbounded();
-    let runner = ChildRunner::new(event_sender);
+    let runner = ChildRunner::new(event_sender, config.raw_output);
     let mut scheduler = Scheduler::new(config.watch.debounce, config.initial_run);
     let mut output = OutputRenderer::terminal(match config.output {
         OutputMode::Passthrough => RenderOutputMode::Passthrough,
@@ -455,6 +461,24 @@ mod tests {
         .unwrap();
 
         assert!(!config.initial_run);
+    }
+
+    #[test]
+    fn raw_output_attaches_child_streams_to_the_terminal() {
+        let temp = tempdir().unwrap();
+        let config = Config::try_parse_from([
+            "stalker",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--watch",
+            ".",
+            "--raw-output",
+            "--",
+            "echo",
+        ])
+        .unwrap();
+
+        assert!(config.raw_output);
     }
 
     #[test]

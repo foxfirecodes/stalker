@@ -26,6 +26,7 @@ use crate::{
 #[derive(Clone)]
 pub struct ChildRunner {
     events: Sender<RunEvent>,
+    raw_output: bool,
     active: Arc<Mutex<HashMap<CommandId, ActiveProcess>>>,
     stopping: Arc<AtomicBool>,
 }
@@ -36,9 +37,13 @@ struct ActiveProcess {
 }
 
 impl ChildRunner {
-    pub fn new(events: Sender<RunEvent>) -> Self {
+    /// When `raw_output` is enabled, child stdout and stderr inherit Stalker's
+    /// terminal instead of being captured and forwarded through the event bus.
+    /// This lets terminal-aware programs retain ANSI color and other TTY output.
+    pub fn new(events: Sender<RunEvent>, raw_output: bool) -> Self {
         Self {
             events,
+            raw_output,
             active: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         }
@@ -109,9 +114,12 @@ impl ChildRunner {
         command
             .args(&spec.args)
             .current_dir(&spec.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::null());
+        if self.raw_output {
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         configure_process_group(&mut command);
 
         let mut child = match command.spawn() {
@@ -143,28 +151,36 @@ impl ChildRunner {
 
         self.send(&spec.id, run_id, RunEventKind::Started { trigger });
 
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let stdout_reader = spawn_reader(
-            stdout,
-            OutputStream::Stdout,
-            self.events.clone(),
-            spec.id.clone(),
-            run_id,
-        );
-        let stderr_reader = spawn_reader(
-            stderr,
-            OutputStream::Stderr,
-            self.events.clone(),
-            spec.id.clone(),
-            run_id,
-        );
+        let readers = if self.raw_output {
+            None
+        } else {
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let stderr = child.stderr.take().expect("stderr was piped");
+            Some((
+                spawn_reader(
+                    stdout,
+                    OutputStream::Stdout,
+                    self.events.clone(),
+                    spec.id.clone(),
+                    run_id,
+                ),
+                spawn_reader(
+                    stderr,
+                    OutputStream::Stderr,
+                    self.events.clone(),
+                    spec.id.clone(),
+                    run_id,
+                ),
+            ))
+        };
 
         let status = child.wait();
         // Pipes close when the child exits. Joining makes every output event
         // arrive before Finished, while readers stream output during the run.
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
+        if let Some((stdout_reader, stderr_reader)) = readers {
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+        }
 
         self.remove_active(&spec.id);
 
@@ -323,7 +339,7 @@ mod tests {
     #[test]
     fn emits_started_output_and_finished() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        ChildRunner::new(sender).start(spec("printf", &["hello"]), 7, RunTrigger::Initial);
+        ChildRunner::new(sender, false).start(spec("printf", &["hello"]), 7, RunTrigger::Initial);
 
         let events: Vec<_> = receiver.iter().take(3).collect();
         assert!(matches!(events[0].kind, RunEventKind::Started { .. }));
@@ -342,7 +358,7 @@ mod tests {
     #[test]
     fn shutdown_terminates_the_active_process_group() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let runner = ChildRunner::new(sender);
+        let runner = ChildRunner::new(sender, false);
         runner.start(spec("sleep", &["10"]), 9, RunTrigger::Initial);
 
         let started = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -363,7 +379,7 @@ mod tests {
     #[test]
     fn forced_shutdown_kills_a_term_ignoring_child_group() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let runner = ChildRunner::new(sender);
+        let runner = ChildRunner::new(sender, false);
         runner.start(
             spec("sh", &["-c", "trap '' TERM; while :; do sleep 1; done"]),
             10,
@@ -388,7 +404,7 @@ mod tests {
     #[test]
     fn reports_spawn_failure() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        ChildRunner::new(sender).start(
+        ChildRunner::new(sender, false).start(
             spec("definitely-not-a-stalker-command", &[]),
             8,
             RunTrigger::Filesystem,

@@ -79,7 +79,7 @@ impl PathFilter {
     }
 
     /// Return a path relative to `cwd`, without requiring that the path still
-    /// exists. Events for paths outside `cwd` cannot match MVP globs.
+    /// exists. Events for paths outside `cwd` do not have a CWD-relative name.
     pub fn normalize(&self, path: &Path) -> Option<PathBuf> {
         normalize_path(&self.cwd, path)
     }
@@ -90,7 +90,12 @@ impl PathFilter {
             return false;
         }
         let Some(path) = self.normalize(path) else {
-            return false;
+            // Include and explicit ignore globs are defined relative to the
+            // working directory, as are repository .gitignore rules. An
+            // external watch root has no meaningful name in that namespace,
+            // so accepting it here makes `--watch /other/path` useful without
+            // accidentally applying the CWD repository's rules to it.
+            return true;
         };
         if self.gitignore.as_ref().is_some_and(|rules| {
             rules.is_ignored(&self.cwd.join(&path), kind == PathKind::Directory)
@@ -406,6 +411,28 @@ mod tests {
         assert!(filter.accepts(Path::new("/repo/tsconfig.json"), PathKind::File));
         assert!(!filter.accepts(Path::new("/repo/other.json"), PathKind::File));
         assert!(filter.accepts(Path::new("/repo"), PathKind::Directory));
+    }
+
+    #[test]
+    fn external_watch_roots_bypass_cwd_gitignore_rules() {
+        let repo = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let watched_file = external.path().join("gfx");
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        fs::write(repo.path().join(".gitignore"), "*\n").unwrap();
+        fs::write(&watched_file, "#!/bin/sh\n").unwrap();
+        let filter = PathFilter::new_with_patterns(
+            repo.path(),
+            &[],
+            &[],
+            Vec::new(),
+            Vec::new(),
+            Some(vec![watched_file.clone()]),
+            GitignoreRules::discover(repo.path()),
+        )
+        .unwrap();
+
+        assert!(filter.accepts(&watched_file, PathKind::File));
     }
 
     #[test]
