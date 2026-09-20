@@ -25,6 +25,12 @@ Pass one or more paths to watch, then put the command after `--`:
 stalker --watch . -- cargo test
 ```
 
+Keep watching and rerunning after changes until the command succeeds, then exit:
+
+```sh
+stalker --watch . --until-success -- cargo test
+```
+
 Watch only Rust source files and restart a local server after a 300 ms quiet
 period:
 
@@ -46,6 +52,8 @@ Useful options:
 - `--ignore GLOB` — skip matching paths, relative to `--cwd`.
 - `--debounce DURATION` — wait for changes to settle; defaults to `150ms`.
 - `--no-initial-run` — do not run until a relevant change arrives.
+- `--until-success` — stop watching and exit with code `0` after the first
+  successful run. Failed runs keep watching for changes.
 - `--markers` — put machine-readable start and end lines around each run.
 - `--raw-output` — attach child output directly to the terminal, retaining
   terminal-aware color and formatting. Cannot be used with `--markers`.
@@ -67,3 +75,8 @@ then groups rapid changes into one rerun after the debounce period.
 Only one child command runs at a time. If files change while it runs, Stalker
 starts one follow-up run as soon as the current command exits. Child output
 passes through unchanged unless you enable `--markers`.
+
+With `--until-success`, an exit code of `0` ends the session, including any
+queued follow-up run. Nonzero exits, signals, and spawn failures keep watching
+for changes. Combine it with `--no-initial-run` to wait for a change before the
+first attempt.

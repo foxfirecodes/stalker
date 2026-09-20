@@ -22,7 +22,7 @@ use signal_hook::{
 };
 
 use crate::{
-    CommandId, CommandSpec, RunEvent, RunEventKind,
+    CommandId, CommandSpec, RunEvent, RunEventKind, RunStatus,
     filter::{PathFilter, PathKind},
     output::{OutputMode as RenderOutputMode, OutputRenderer},
     runner::ChildRunner,
@@ -66,6 +66,10 @@ struct Cli {
     #[arg(long = "no-initial-run", action = ArgAction::SetTrue, conflicts_with = "initial_run")]
     no_initial_run: bool,
 
+    /// Stop watching after the command exits successfully (exit code 0).
+    #[arg(long, action = ArgAction::SetTrue)]
+    until_success: bool,
+
     /// Frame each run with Stalker marker lines.
     #[arg(long, action = ArgAction::SetTrue)]
     markers: bool,
@@ -100,6 +104,7 @@ pub struct Config {
     pub output: OutputMode,
     pub raw_output: bool,
     pub initial_run: bool,
+    pub until_success: bool,
     pub print_events: bool,
     pub gitignore: bool,
 }
@@ -177,6 +182,7 @@ impl Config {
             },
             raw_output: cli.raw_output,
             initial_run: !cli.no_initial_run,
+            until_success: cli.until_success,
             print_events: cli.print_events,
             gitignore: !cli.no_gitignore,
         })
@@ -290,7 +296,10 @@ pub fn run() -> Result<()> {
     while !stopping.load(Ordering::Relaxed) {
         start_due_run(&mut scheduler, &runner, &command);
         drain_watch_events(&watcher, &filter, &mut scheduler, config.print_events)?;
-        drain_run_events(&event_receiver, &mut output, &mut scheduler)?;
+        let succeeded = drain_run_events(&event_receiver, &mut output, &mut scheduler)?;
+        if config.until_success && succeeded {
+            break;
+        }
 
         let wait = scheduler
             .next_deadline()
@@ -298,7 +307,12 @@ pub fn run() -> Result<()> {
             .unwrap_or(Duration::from_millis(25))
             .min(Duration::from_millis(25));
         match event_receiver.recv_timeout(wait) {
-            Ok(event) => handle_run_event(event, &mut output, &mut scheduler)?,
+            Ok(event) => {
+                let succeeded = handle_run_event(event, &mut output, &mut scheduler)?;
+                if config.until_success && succeeded {
+                    break;
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => bail!("run event channel disconnected"),
         }
@@ -388,27 +402,36 @@ fn drain_run_events(
     events: &Receiver<RunEvent>,
     output: &mut OutputRenderer<io::Stdout, io::Stderr>,
     scheduler: &mut Scheduler,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut succeeded = false;
     while let Ok(event) = events.try_recv() {
-        handle_run_event(event, output, scheduler)?;
+        succeeded |= handle_run_event(event, output, scheduler)?;
     }
-    Ok(())
+    Ok(succeeded)
 }
 
+/// Render an event and report whether the active run completed successfully.
 fn handle_run_event(
     event: RunEvent,
     output: &mut OutputRenderer<io::Stdout, io::Stderr>,
     scheduler: &mut Scheduler,
-) -> Result<()> {
+) -> Result<bool> {
     let completed_run = match event.kind {
         RunEventKind::Finished { .. } | RunEventKind::SpawnFailed { .. } => Some(event.run_id),
         RunEventKind::Started { .. } | RunEventKind::Output { .. } => None,
     };
     output.render(&event)?;
     if let Some(run_id) = completed_run {
-        scheduler.finish(run_id, std::time::Instant::now());
+        let completed = scheduler.finish(run_id, std::time::Instant::now());
+        return Ok(completed
+            && matches!(
+                event.kind,
+                RunEventKind::Finished {
+                    status: RunStatus::ExitCode(0)
+                }
+            ));
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -441,6 +464,7 @@ mod tests {
         .unwrap();
 
         assert!(config.initial_run);
+        assert!(!config.until_success);
         assert_eq!(config.commands[0].program, PathBuf::from("echo"));
         assert_eq!(config.commands[0].args, [OsString::from("hello")]);
     }
@@ -460,6 +484,26 @@ mod tests {
         ])
         .unwrap();
 
+        assert!(!config.initial_run);
+    }
+
+    #[test]
+    fn until_success_can_wait_for_the_first_change() {
+        let temp = tempdir().unwrap();
+        let config = Config::try_parse_from([
+            "stalker",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--watch",
+            ".",
+            "--until-success",
+            "--no-initial-run",
+            "--",
+            "echo",
+        ])
+        .unwrap();
+
+        assert!(config.until_success);
         assert!(!config.initial_run);
     }
 
