@@ -1,0 +1,16 @@
+[env]
+_.path = ["{{config_root}}/target/toolchain/bin"]
+SDKROOT = "{{config_root}}/target/toolchain/MacOSX11.3.sdk"
+CARGO_ZIGBUILD_ZIG_PATH = "{{config_root}}/target/toolchain/bin/python-zig"
+CARGO_ZIGBUILD_CACHE_DIR = "{{config_root}}/target/zigbuild-cache"
+ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/target/zig-cache"
+
+[tasks.setup]
+description = "Install cross-compilation tools, Rust targets, and the macOS SDK"
+raw = true
+run = "bash scripts/setup.sh"
+
+[tasks.dist]
+description = "Build standalone Linux and macOS binaries with embedded helpers"
+raw = true
+run = "cargo xtask dist"

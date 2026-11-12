@@ -122,8 +122,26 @@ Full builds embed helpers for all four targets: Linux x86-64/ARM64 using static
 musl, and macOS Intel/Apple Silicon. macOS builds default to macOS 11.0 or newer;
 set `MACOSX_DEPLOYMENT_TARGET` to override that minimum.
 
-Install [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) and Zig, add
-the Rust targets, and point `SDKROOT` at a macOS SDK:
+With [mise](https://mise.jdx.dev/), bootstrap the cross-compilation environment
+and build all four platforms:
+
+```sh
+mise run setup
+mise run dist
+```
+
+Setup requires Rust/rustup, Python 3 with `venv` support, curl, and tar with xz
+support. It installs pinned cargo-zigbuild and Zig versions into
+`target/toolchain`, adds the four Rust targets, and downloads the macOS 11.3 SDK
+used by cargo-zigbuild's Linux build image. The SDK archive is verified against a
+pinned SHA-256 before extraction. Repeated runs reuse the installed tools and SDK.
+Mise sets `PATH`, `SDKROOT`, and the compiler cache paths for you; no manual
+exports are needed. Use `mise exec -- cargo xtask build --release` to build a
+native main binary with all four helpers using the same environment.
+
+For manual setup, install
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) and Zig, add the
+Rust targets, and point `SDKROOT` at a macOS SDK:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
