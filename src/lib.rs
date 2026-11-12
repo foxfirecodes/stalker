@@ -1,11 +1,12 @@
 //! `stalker` reruns configured commands after relevant filesystem changes.
 
 pub mod config;
-pub mod filter;
+pub use stalker_watch::filter;
 pub mod output;
 pub mod runner;
 pub mod scheduler;
-pub mod watcher;
+pub use stalker_watch::watcher;
+pub mod remote;
 
 use std::{ffi::OsString, path::PathBuf, time::SystemTime};
 

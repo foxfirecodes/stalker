@@ -1,7 +1,6 @@
 //! CLI parsing and validated runtime configuration.
 
 use std::{
-    env,
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -12,10 +11,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{ArgAction, Parser};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use globset::Glob;
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     flag,
@@ -23,8 +21,9 @@ use signal_hook::{
 
 use crate::{
     CommandId, CommandSpec, RunEvent, RunEventKind, RunStatus,
-    filter::{PathFilter, PathKind},
+    filter::PathFilter,
     output::{OutputMode as RenderOutputMode, OutputRenderer},
+    remote::{RemoteSpec, RemoteWatcher},
     runner::ChildRunner,
     scheduler::Scheduler,
     watcher::{NativeWatcher, WatchEvent},
@@ -38,6 +37,18 @@ use crate::{
     about = "Rerun a command after filesystem changes"
 )]
 struct Cli {
+    /// SSH destination whose filesystem should be watched. The command stays local.
+    #[arg(long, value_name = "DESTINATION")]
+    remote: Option<String>,
+
+    /// Remote base directory for watch paths and globs. Defaults to the SSH login directory.
+    #[arg(long, value_name = "PATH", requires = "remote")]
+    remote_cwd: Option<PathBuf>,
+
+    /// OpenSSH configuration option (KEY=VALUE); repeat to supply more than one.
+    #[arg(long = "ssh-option", value_name = "KEY=VALUE", requires = "remote")]
+    ssh_options: Vec<String>,
+
     /// Child working directory. Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
     cwd: Option<PathBuf>,
@@ -99,6 +110,7 @@ struct Cli {
 /// Validated configuration used by the runner.
 #[derive(Debug)]
 pub struct Config {
+    pub remote: Option<RemoteSpec>,
     pub commands: Vec<CommandSpec>,
     pub watch: WatchSpec,
     pub output: OutputMode,
@@ -109,21 +121,10 @@ pub struct Config {
     pub gitignore: bool,
 }
 
-/// Filesystem roots and matching rules shared by all commands in the MVP.
-#[derive(Debug)]
-pub struct WatchSpec {
-    /// Existing, canonical roots passed to the native watcher.
-    pub roots: Vec<PathBuf>,
-    /// Compiled include patterns, relative to `cwd`.
-    pub includes: Vec<Glob>,
-    /// Compiled ignore patterns, relative to `cwd`.
-    pub ignores: Vec<Glob>,
-    /// Original include text, retained for conservative directory matching.
-    pub include_patterns: Vec<String>,
-    /// Original ignore text, retained for conservative directory matching.
-    pub ignore_patterns: Vec<String>,
-    pub debounce: Duration,
-}
+pub use stalker_watch::config::WatchSpec;
+use stalker_watch::config::{
+    canonical_directory, canonical_watch_path, compile_globs, compile_ignore_globs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputMode {
@@ -148,11 +149,22 @@ impl Config {
 
     fn from_cli(cli: Cli) -> Result<Self> {
         let cwd = canonical_directory(cli.cwd.as_deref().unwrap_or_else(|| Path::new(".")))?;
-        let roots = cli
-            .watch
-            .iter()
-            .map(|path| canonical_watch_path(&cwd, path))
-            .collect::<Result<Vec<_>>>()?;
+        if cli
+            .remote
+            .as_ref()
+            .is_some_and(|destination| destination.is_empty() || destination.starts_with('-'))
+        {
+            bail!("remote must be an SSH destination, such as user@host or ssh://user@host:port");
+        }
+        let roots = if cli.remote.is_some() {
+            // Only the remote helper can resolve these paths and expand its HOME.
+            cli.watch
+        } else {
+            cli.watch
+                .iter()
+                .map(|path| canonical_watch_path(&cwd, path))
+                .collect::<Result<Vec<_>>>()?
+        };
         let includes = compile_globs(&cli.include, "include")?;
         let ignores = compile_ignore_globs(&cli.ignore)?;
 
@@ -166,6 +178,11 @@ impl Config {
         };
 
         Ok(Self {
+            remote: cli.remote.map(|destination| RemoteSpec {
+                destination,
+                cwd: cli.remote_cwd,
+                ssh_options: cli.ssh_options,
+            }),
             commands: vec![command_spec],
             watch: WatchSpec {
                 roots,
@@ -223,65 +240,39 @@ pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        env::current_dir()?.join(path)
-    };
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("could not resolve working directory {}", path.display()))?;
-    if !path.is_dir() {
-        bail!("working directory {} is not a directory", path.display());
-    }
-    Ok(path)
-}
-
-fn canonical_watch_path(cwd: &Path, path: &Path) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    };
-    path.canonicalize()
-        .with_context(|| format!("could not resolve watch path {}", path.display()))
-}
-
-fn compile_globs(patterns: &[String], kind: &str) -> Result<Vec<Glob>> {
-    patterns
-        .iter()
-        .map(|pattern| {
-            Glob::new(pattern).with_context(|| format!("invalid {kind} glob {pattern:?}"))
-        })
-        .collect()
-}
-
-/// A plain directory name is the common spelling for ignoring that directory.
-/// Keep its exact match and add descendants so `--ignore target` behaves like
-/// `--ignore target/**` for file events.
-fn compile_ignore_globs(patterns: &[String]) -> Result<Vec<Glob>> {
-    let mut expanded = Vec::with_capacity(patterns.len() * 2);
-    for pattern in patterns {
-        expanded.push(pattern.clone());
-        let directory = pattern.trim_end_matches('/');
-        if !directory.is_empty()
-            && !directory.contains(['*', '?', '[', '{'])
-            && !pattern.ends_with("/**")
-        {
-            expanded.push(format!("{directory}/**"));
-        }
-    }
-    compile_globs(&expanded, "ignore")
-}
-
 pub fn run() -> Result<()> {
     let config = Config::parse()?;
     let command = config.commands[0].clone();
-    let filter = PathFilter::from_watch_spec(&command.cwd, &config.watch, config.gitignore)?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    flag::register(SIGINT, Arc::clone(&stopping))?;
+    flag::register(SIGTERM, Arc::clone(&stopping))?;
     // Start watching before scheduling the initial run so a change in that
     // startup window cannot be missed.
-    let watcher = NativeWatcher::new(config.watch.roots.clone())?;
+    let watcher = if let Some(remote) = &config.remote {
+        use stalker_watch::protocol::{self, WatchRequest, WirePath};
+        EventSource::Remote(RemoteWatcher::new(
+            remote,
+            WatchRequest {
+                version: protocol::VERSION,
+                cwd: remote.cwd.as_deref().map(WirePath::new),
+                roots: config
+                    .watch
+                    .roots
+                    .iter()
+                    .map(|path| WirePath::new(path))
+                    .collect(),
+                includes: config.watch.include_patterns.clone(),
+                ignores: config.watch.ignore_patterns.clone(),
+                gitignore: config.gitignore,
+            },
+            &stopping,
+        )?)
+    } else {
+        EventSource::Native {
+            filter: PathFilter::from_watch_spec(&command.cwd, &config.watch, config.gitignore)?,
+            watcher: NativeWatcher::new(config.watch.roots.clone())?,
+        }
+    };
     let (event_sender, event_receiver) = crossbeam_channel::unbounded();
     let runner = ChildRunner::new(event_sender, config.raw_output);
     let mut scheduler = Scheduler::new(config.watch.debounce, config.initial_run);
@@ -289,35 +280,35 @@ pub fn run() -> Result<()> {
         OutputMode::Passthrough => RenderOutputMode::Passthrough,
         OutputMode::Markers => RenderOutputMode::Markers,
     });
-    let stopping = Arc::new(AtomicBool::new(false));
-    flag::register(SIGINT, Arc::clone(&stopping))?;
-    flag::register(SIGTERM, Arc::clone(&stopping))?;
-
-    while !stopping.load(Ordering::Relaxed) {
-        start_due_run(&mut scheduler, &runner, &command);
-        drain_watch_events(&watcher, &filter, &mut scheduler, config.print_events)?;
-        let succeeded = drain_run_events(&event_receiver, &mut output, &mut scheduler)?;
-        if config.until_success && succeeded {
-            break;
-        }
-
-        let wait = scheduler
-            .next_deadline()
-            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
-            .unwrap_or(Duration::from_millis(25))
-            .min(Duration::from_millis(25));
-        match event_receiver.recv_timeout(wait) {
-            Ok(event) => {
-                let succeeded = handle_run_event(event, &mut output, &mut scheduler)?;
-                if config.until_success && succeeded {
-                    break;
-                }
+    let outcome = (|| -> Result<()> {
+        while !stopping.load(Ordering::Relaxed) {
+            drain_watch_events(&watcher, &mut scheduler, config.print_events)?;
+            start_due_run(&mut scheduler, &runner, &command);
+            let succeeded = drain_run_events(&event_receiver, &mut output, &mut scheduler)?;
+            if config.until_success && succeeded {
+                break;
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => bail!("run event channel disconnected"),
-        }
-    }
 
+            let wait = scheduler
+                .next_deadline()
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(Duration::from_millis(25))
+                .min(Duration::from_millis(25));
+            match event_receiver.recv_timeout(wait) {
+                Ok(event) => {
+                    let succeeded = handle_run_event(event, &mut output, &mut scheduler)?;
+                    if config.until_success && succeeded {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => bail!("run event channel disconnected"),
+            }
+        }
+        Ok(())
+    })();
+
+    // Transport failures must also stop an active local command and its children.
     runner.shutdown();
     let graceful_deadline = std::time::Instant::now() + Duration::from_millis(500);
     while runner.is_active() && std::time::Instant::now() < graceful_deadline {
@@ -334,8 +325,37 @@ pub fn run() -> Result<()> {
         }
     }
     drain_run_events(&event_receiver, &mut output, &mut scheduler)?;
-    Ok(())
+    outcome
 }
+
+enum EventSource {
+    Native {
+        watcher: NativeWatcher,
+        filter: PathFilter,
+    },
+    Remote(RemoteWatcher),
+}
+
+impl EventSource {
+    fn try_recv(&self) -> Result<Option<WatchEvent>> {
+        match self {
+            Self::Remote(watcher) => watcher.try_recv(),
+            Self::Native { watcher, filter } => {
+                for _ in 0..256 {
+                    let Some(event) = watcher.try_recv()? else {
+                        break;
+                    };
+                    if event_is_relevant(&event, filter) {
+                        return Ok(Some(event));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+use stalker_watch::event_is_relevant;
 
 fn start_due_run(scheduler: &mut Scheduler, runner: &ChildRunner, command: &CommandSpec) {
     if let Some(run) = scheduler.take_due_run(std::time::Instant::now()) {
@@ -344,38 +364,21 @@ fn start_due_run(scheduler: &mut Scheduler, runner: &ChildRunner, command: &Comm
 }
 
 fn drain_watch_events(
-    watcher: &NativeWatcher,
-    filter: &PathFilter,
+    watcher: &EventSource,
     scheduler: &mut Scheduler,
     print_events: bool,
 ) -> Result<()> {
-    while let Some(event) = watcher.try_recv()? {
-        if !event_is_relevant(&event, filter) {
-            continue;
-        }
+    // Give command completions and signals a turn even during continuous writes.
+    for _ in 0..256 {
+        let Some(event) = watcher.try_recv()? else {
+            break;
+        };
         if print_events {
             print_event(&event)?;
         }
         scheduler.change(std::time::Instant::now());
     }
     Ok(())
-}
-
-fn event_is_relevant(event: &WatchEvent, filter: &PathFilter) -> bool {
-    if event.is_overflow {
-        return true;
-    }
-    // A backend can report a broad directory-level change without a usable
-    // path. It may contain an included descendant, so rerun conservatively.
-    if event.is_broad && event.paths.is_empty() {
-        return true;
-    }
-    let kind = if event.is_directory || event.is_broad {
-        PathKind::Directory
-    } else {
-        PathKind::File
-    };
-    event.paths.iter().any(|path| filter.accepts(path, kind))
 }
 
 fn print_event(event: &WatchEvent) -> io::Result<()> {
@@ -437,8 +440,52 @@ fn handle_run_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::PathKind;
     use globset::Glob;
     use tempfile::tempdir;
+
+    #[test]
+    fn remote_paths_are_resolved_remotely_while_cwd_stays_local() {
+        let temp = tempdir().unwrap();
+        let config = Config::try_parse_from([
+            "stalker",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--remote",
+            "ssh://user@host:2222",
+            "--remote-cwd",
+            "~/remote-project",
+            "--watch",
+            "does-not-exist-locally",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.watch.roots,
+            vec![PathBuf::from("does-not-exist-locally")]
+        );
+        assert_eq!(config.commands[0].cwd, temp.path().canonicalize().unwrap());
+        assert_eq!(
+            config.remote.unwrap().cwd.unwrap(),
+            PathBuf::from("~/remote-project")
+        );
+        assert!(
+            Config::try_parse_from(["stalker", "--remote-cwd", ".", "--watch", ".", "--", "true"])
+                .is_err()
+        );
+        assert!(
+            Config::try_parse_from([
+                "stalker",
+                "--remote=-oProxyCommand=bad",
+                "--watch",
+                ".",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn duration_parser_accepts_mvp_units() {
